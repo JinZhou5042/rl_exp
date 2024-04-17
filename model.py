@@ -1,6 +1,9 @@
 import pandas as pd
 import glob
 import os
+import torch
+from torch import nn
+from torch.nn import functional as F
 
 
 def combine_csv(output_csv='resource_consumption_report.csv'):
@@ -31,16 +34,36 @@ def parse_report_to_state(report_path):
     return state
 
 
-class RLAgent:
-    def __init__(self, model):
-        self.model = model
+class TransformerModel(nn.Module):
+    def __init__(self, input_dim, output_dim, dim_model=64, nhead=2, num_encoder_layers=2, num_decoder_layers=2):
+        super(TransformerModel, self).__init__()
+        self.transformer = nn.Transformer(d_model=dim_model, nhead=nhead,
+                                          num_encoder_layers=num_encoder_layers,
+                                          num_decoder_layers=num_decoder_layers)
+        self.input_proj = nn.Linear(input_dim, dim_model)
+        self.output_proj = nn.Linear(dim_model, output_dim)
+
+    def forward(self, src):
+        src = self.input_proj(src)
+        src = src.unsqueeze(1)
+        output = self.transformer(src, src)
+        output = self.output_proj(output.squeeze(1)) 
+        return F.relu(output) 
+    
+
+class RLAgentWithTransformer:
+    def __init__(self, transformer_model):
+        self.model = transformer_model
 
     def get_state(self, report_path):
-        report_csv = combine_csv()
+        report_csv = 'resource_consumption_report.csv' 
+        combine_csv(report_csv)
         state = parse_report_to_state(report_csv)
         return state
     
     def select_action(self, state):
-        action = self.model.predict(state)
-        return action
-
+        state_values = list(state.values())
+        state_tensor = torch.tensor(state_values, dtype=torch.float32).unsqueeze(0)
+        with torch.no_grad():
+            action = self.model(state_tensor)
+        return action.item() 
