@@ -16,9 +16,9 @@ import threading
 def main():
     parser = argparse.ArgumentParser(description="")
     parser.add_argument('--port', type=int, default=9124)
-    parser.add_argument('--tasks', type=int, default=128)
-    parser.add_argument('--size', type=int, default=1000)
-    parser.add_argument('--library-cores', default=8, type=int)
+    parser.add_argument('--tasks', type=int, default=1000)
+    parser.add_argument('--size', type=int, default=100)
+    parser.add_argument('--library-cores', default=16, type=int)
     parser.add_argument('--library-memory', default=1000, type=int)
     parser.add_argument('--function-slots', default=8, type=int)
     args = parser.parse_args()

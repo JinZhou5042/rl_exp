@@ -20,8 +20,6 @@ from noise import OrnsteinUhlenbeckActionNoise as OUNoise
 from replay_buffer import Buffer
 from models import Actor, Critic
 
-plot_fig = False
-
 # Hyperparameters
 ACTOR_LR = 0.0003
 CRITIC_LR = 0.003
@@ -34,11 +32,11 @@ CHECKPOINT_DIR = './checkpoints/manipulator/'
 BUFFER_SIZE = 100000
 DISCOUNT = 0.9
 TAU = 0.001
-REPLAY_BUFFER_THRESHOLD = 70
+REPLAY_BUFFER_THRESHOLD = 50
 EPSILON = 1.0
 EPSILON_DECAY = 1e-6
 
-NUM_STATES = 2                  # 
+NUM_STATES = 10                 # 
 NUM_ACTIONS = 9                 # (0, 1, 2) for library_cores, (3, 4, 5) for library_memory, (6, 7, 8) for function_slots
                                 # 0 for no change, 1 for increase, 2 for decrease
 
@@ -56,7 +54,9 @@ class DDPG:
         self.function_slots = None
         self.library_memory = None
 
-        self.task_batch_submitted = 0
+        self.MAX_LIBRARY_CORES = 16
+        self.MAX_LIBRARY_MEMORY = 1000000
+        self.MAX_FUNCTION_SLOTS = 16
         
         self.function_calls = []
         self.submitted_function_calls = set()  # record the submitted tasks
@@ -76,6 +76,7 @@ class DDPG:
         self.noise = OUNoise(mu=np.zeros(self.action_dim), sigma=SIGMA)
         self.replay_buffer = Buffer(BUFFER_SIZE)
 
+        self.functions_per_step = 200
         self.batch_size = MINIBATCH_SIZE
         self.checkpoint_dir = CHECKPOINT_DIR
         self.discount = DISCOUNT
@@ -86,7 +87,7 @@ class DDPG:
         self.current_state = None
 
         self.reward_graph = []
-   
+
         self.num_epochs = NUM_EPISODES
 
         self.available_actions = {
@@ -109,10 +110,13 @@ class DDPG:
         self.library_memory = library_memory
         self.function_slots = function_slots
 
-        self.library_task = self.manager.create_library_from_functions(library_name, function, add_env=True)
+        self.library_task = self.manager.create_library_from_functions(library_name, function, add_env=False)
+        self.library_task.set_env_var('PATH', '/scratch365/jzhou24/env/bin/:$PATH')
+
         self.library_task.set_cores(library_cores)
         self.library_task.set_memory(library_memory)
         self.library_task.set_function_slots(function_slots)
+
 
         self.manager.install_library(self.library_task)
 
@@ -123,8 +127,6 @@ class DDPG:
         self.library_cores = None
         self.function_slots = None
         self.library_memory = None
-        self.task_batch_submitted = 0
-        self.all_states_df = pd.DataFrame()
 
     def syn_states(self):
         data_dir = '.'
@@ -134,9 +136,10 @@ class DDPG:
             if file.startswith('task') and file.endswith('.csv'):
                 file_path = os.path.join(data_dir, file)
                 df = pd.read_csv(file_path)
+                os.remove(file_path)
                 new_df = pd.concat([new_df, df], ignore_index=True)
 
-        if not new_df.empty:
+        if not new_df.empty and 'timestamp' in new_df.columns:
             new_df = new_df.sort_values(by='timestamp')
             if self.all_states_df.empty:
                 self.all_states_df = new_df
@@ -158,13 +161,6 @@ class DDPG:
         else:
             return -abs(cpu_util + mem_util - 2)
 
-    def reset(self):
-        self.remove_library()
-        self.all_states_df = pd.DataFrame()
-        self.batch_start_timestamps = []
-        self.batch_end_timestamps = []
-        self.task_batch_submitted = 0
-
     def get_action(self, action, action_range_start, action_range_end, available_actions):
         if action_range_start <= action < action_range_end:
             return available_actions[action - action_range_start]
@@ -182,7 +178,8 @@ class DDPG:
                 'avg_network_latency': 0,
                 'library_cores': self.library_cores,
                 'library_memory': self.library_memory,
-                'function_slots': self.function_slots
+                'function_slots': self.function_slots,
+                'remaining_function_calls': len(self.function_calls),
             }
             return state
         last_start_timestamp = self.batch_start_timestamps[-1]
@@ -196,14 +193,14 @@ class DDPG:
             'avg_network_latency': states_df['avg_latency'].mean(),
             'library_cores': self.library_cores,
             'library_memory': self.library_memory,
-            'function_slots': self.function_slots
+            'function_slots': self.function_slots,
+            'remaining_function_calls': len(self.function_calls) - len(self.submitted_function_calls),
         }
         
         return state
     
     def get_reward(self):
         state = self.get_state()
-        print(f"state = {state}")
         cpu_util = state["avg_user_total_cpu_usage"] / (self.library_cores * 100)
         mem_util = state["avg_user_memory_used_mb"] / self.library_memory
         reward =  self._cal_reward(cpu_util, mem_util)
@@ -233,30 +230,31 @@ class DDPG:
 
     # Inputs: Current state of the episode
     # Output: the action which maximizes the Q-value of the current state-action pair
-    def get_max_action(self, curState):
+    def get_max_action(self, current_state):
         noise = self.epsilon * Variable(torch.FloatTensor(self.noise()))
-        action = self.actor(curState)
-        actionNoise = action + noise
+        action = self.actor(current_state) + noise
         
         # get the max
-        action_list = actionNoise.tolist()[0]
+        action_list = action.tolist()[0]
         max_action = max(action_list)
         max_index = action_list.index(max_action)
 
-        return max_index, actionNoise
+        return max_index, action
 
     def register_function_calls(self, function_calls):
         self.function_calls = function_calls
 
     def submit_function_calls(self, num):
-        self.task_batch_submitted = 0
+        tasks_submitted = 0
         for funcall in self.function_calls:
             if funcall not in self.submitted_function_calls:
                 self.manager.submit(funcall)
                 self.submitted_function_calls.add(funcall)
-                self.task_batch_submitted += 1
-                if self.task_batch_submitted >= num:
+                funcall.set_env_var('PATH', '/scratch365/jzhou24/env/bin/:$PATH')
+                tasks_submitted += 1
+                if tasks_submitted >= num:
                     break
+        return tasks_submitted
 
     def get_batch_time_elapsed(self):
         if not self.batch_start_timestamps or not self.batch_end_timestamps:
@@ -272,8 +270,8 @@ class DDPG:
     def run_batch(self):
         from tqdm import tqdm
         self.batch_start_timestamps.append(time.time())
-        self.submit_function_calls(self.batch_size)
-        pbar = tqdm(total=self.batch_size)
+        tasks_submitted = self.submit_function_calls(self.functions_per_step)
+        pbar = tqdm(total=tasks_submitted)
         while not self.manager.empty():
             t = self.manager.wait(0)
             if t:
@@ -283,10 +281,25 @@ class DDPG:
         pbar.close()
 
     def reset_state(self):
-        self.task_batch_submitted = 0
         self.all_states_df = pd.DataFrame()
         self.batch_start_timestamps = []
         self.batch_end_timestamps = []
+        # randomize the library cores, library memory, function slots
+        self.library_cores = random.randint(1, 16)
+        self.library_memory = random.randint(100, 1000)
+        self.function_slots = random.randint(2, 16)
+        self.current_state = {
+            'avg_user_total_cpu_usage': 0,
+            'avg_user_memory_used_mb': 0,
+            'avg_user_concurrent_tasks': 0,
+            'avg_bytes_sent_throughput': 0,
+            'avg_bytes_recv_throughput': 0,
+            'avg_network_latency': 0,
+            'library_cores': self.library_cores,
+            'library_memory': self.library_memory,
+            'function_slots': self.function_slots,
+            'remaining_function_calls': len(self.function_calls),
+        }
 
     # training of the original and target actor-critic networks
     def train(self):
@@ -299,39 +312,43 @@ class DDPG:
         for epoch in range(0, self.num_epochs):
             epoch_reward = 0
             self.reset_state()
+            num_steps = len(self.function_calls) // self.functions_per_step
 
-            for step in range(NUM_TIMESTEPS):
-
+            for step in range(num_steps):
                 current_state = self.current_state
-                avg_user_total_cpu_usage = current_state["avg_user_total_cpu_usage"]
-                avg_user_memory_used_mb = current_state["avg_user_memory_used_mb"]
-
+                
                 # get maximizing action
-                current_state_tensor = Variable(obs_to_state([avg_user_total_cpu_usage, avg_user_memory_used_mb]))
+                current_state_tensor = Variable(obs_to_state(list(current_state.values())))
                 self.actor.eval()
-                action_index, action = self.get_max_action(current_state_tensor)
 
-                print(f"action_index = {action_index}, action = {action}")
+                action_index, action = self.get_max_action(current_state_tensor)
 
                 # get the action
                 library_cores_action = self.get_action(action_index, *self.action_ranges['library_cores'], self.available_actions['library_cores'])
                 library_memory_action = self.get_action(action_index, *self.action_ranges['library_memory'], self.available_actions['library_memory'])
                 function_slots_action = self.get_action(action_index, *self.action_ranges['function_slots'], self.available_actions['function_slots'])
-
+                
                 self.actor.train()
                 
                 # take the action
-                self.reinstall_library(self.library_cores + library_cores_action, self.library_memory + library_memory_action, self.function_slots + function_slots_action)
+                self.library_cores += library_cores_action
+                self.library_memory += library_memory_action
+                self.function_slots += function_slots_action
+                self.library_cores = max(1, min(self.library_cores, self.MAX_LIBRARY_CORES))
+                self.library_memory = max(100, min(self.library_memory, self.MAX_LIBRARY_MEMORY))
+                self.function_slots = max(2, min(self.function_slots, self.MAX_FUNCTION_SLOTS))
+
+                self.reinstall_library(self.library_cores, self.library_memory, self.function_slots)
                 self.run_batch()
 
                 next_state = self.get_state()
+                self.current_state = next_state
                 reward = self.get_reward()
                 epoch_reward += reward
-                print(f"reward = {reward}")
-                
-                avg_user_total_cpu_usage = next_state["avg_user_total_cpu_usage"]
-                avg_user_memory_used_mb = next_state["avg_user_memory_used_mb"]
-                next_state_tensor = Variable(obs_to_state([avg_user_total_cpu_usage, avg_user_memory_used_mb]))
+
+                print(f"epoch = {epoch}, step = {step}, action = ({self.library_cores}, {self.library_memory}, {self.function_slots}), reward = {reward}")
+
+                next_state_tensor = Variable(obs_to_state(list(next_state.values())))
                 self.replay_buffer.append((current_state_tensor, action, next_state_tensor, reward))
 
                 # if the replay buffer is full, start training
@@ -362,6 +379,7 @@ class DDPG:
                     self.update_targets(self.target_actor, self.actor)
                     self.update_targets(self.target_critic, self.critic)
                     self.epsilon -= self.epsilon_decay
+                
             print(f"epoch_reward = {epoch_reward}")
             self.reward_graph.append(epoch_reward)
             

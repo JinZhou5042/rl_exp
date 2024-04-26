@@ -1,5 +1,4 @@
 {
-    {
     "manager-name": "rl-manager",
     "max-workers": 4,
     "min-workers": 4,
