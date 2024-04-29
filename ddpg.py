@@ -1,13 +1,15 @@
 # PyTorch
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 import torch.optim as optim
 import ndcctools.taskvine as vine
 
 # Lib
+import json
 import numpy as np
+import copy
 import random
+import glob
 from copy import deepcopy
 import matplotlib.pyplot as plt
 # from IPython import display
@@ -22,8 +24,8 @@ from models import Actor, Critic
 
 # Hyperparameters
 ACTOR_LR = 0.0003
-CRITIC_LR = 0.003
-MINIBATCH_SIZE = 64
+CRITIC_LR = 0.001
+MINIBATCH_SIZE = 8
 NUM_EPISODES = 9000
 NUM_TIMESTEPS = 300
 MU = 0
@@ -32,7 +34,7 @@ CHECKPOINT_DIR = './checkpoints/manipulator/'
 BUFFER_SIZE = 100000
 DISCOUNT = 0.9
 TAU = 0.001
-REPLAY_BUFFER_THRESHOLD = 50
+REPLAY_BUFFER_THRESHOLD = 8
 EPSILON = 1.0
 EPSILON_DECAY = 1e-6
 
@@ -46,23 +48,32 @@ def obs_to_state(state_list):
     return torch.FloatTensor(state_list).view(1, -1)
 
 class DDPG:
-    def __init__(self, manager):
+    def __init__(self, manager, library_name, function, library_cores, library_memory, function_slots, size_tasks, num_tasks):
+        for csv_file in glob.glob('*.csv'):
+            os.remove(csv_file)
+
         self.manager = manager
-        self.library_name = None
+        self.library_name = library_name
+        self.library_cores = library_cores
+        self.function_slots = function_slots
+        self.library_memory = library_memory
+        self.function = function
         self.library_task = None
-        self.library_cores = None
-        self.function_slots = None
-        self.library_memory = None
+
+        self.create_library('rl-library', self.function, self.library_cores, self.library_memory, self.function_slots)
+        
+        self.size_tasks = size_tasks
+        self.num_tasks = num_tasks
 
         self.MAX_LIBRARY_CORES = 16
         self.MAX_LIBRARY_MEMORY = 1000000
         self.MAX_FUNCTION_SLOTS = 16
         
-        self.function_calls = []
+        self.all_function_calls = []
         self.submitted_function_calls = set()  # record the submitted tasks
 
         self.all_states_df = pd.DataFrame()
-        self.batch_start_timestamps = []
+        self.start_timestamps = []
         self.batch_end_timestamps = []
     
         self.state_dim = NUM_STATES
@@ -74,9 +85,10 @@ class DDPG:
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=CRITIC_LR)
         self.noise = OUNoise(mu=np.zeros(self.action_dim), sigma=SIGMA)
+        self.mseloss = nn.MSELoss()
         self.replay_buffer = Buffer(BUFFER_SIZE)
 
-        self.functions_per_step = 200
+        self.functions_per_step = 20
         self.batch_size = MINIBATCH_SIZE
         self.checkpoint_dir = CHECKPOINT_DIR
         self.discount = DISCOUNT
@@ -117,7 +129,6 @@ class DDPG:
         self.library_task.set_memory(library_memory)
         self.library_task.set_function_slots(function_slots)
 
-
         self.manager.install_library(self.library_task)
 
     def remove_library(self):
@@ -127,39 +138,40 @@ class DDPG:
         self.library_cores = None
         self.function_slots = None
         self.library_memory = None
+        time.sleep(5)
 
     def syn_states(self):
         data_dir = '.'
-        # syn data newly generated
-        new_df = pd.DataFrame()
+        data_frames = [] 
+
         for file in os.listdir(data_dir):
             if file.startswith('task') and file.endswith('.csv'):
                 file_path = os.path.join(data_dir, file)
-                df = pd.read_csv(file_path)
-                os.remove(file_path)
-                new_df = pd.concat([new_df, df], ignore_index=True)
+                try:
+                    df = pd.read_csv(file_path)
+                    data_frames.append(df)
+                    os.remove(file_path) 
+                except Exception as e:
+                    print(f"Error reading {file_path}: {e}")
 
-        if not new_df.empty and 'timestamp' in new_df.columns:
-            new_df = new_df.sort_values(by='timestamp')
-            if self.all_states_df.empty:
-                self.all_states_df = new_df
-            else:
-                self.all_states_df = pd.concat([self.all_states_df, new_df]).drop_duplicates().sort_values(by='timestamp')
-    
+        if data_frames:
+            new_df = pd.concat(data_frames, ignore_index=True)
+            if 'timestamp' in new_df.columns:
+                new_df.sort_values(by='timestamp', inplace=True)
+                if self.all_states_df.empty:
+                    self.all_states_df = new_df
+                else:
+                    self.all_states_df = pd.concat([self.all_states_df, new_df], ignore_index=True)
+        
+        if not self.all_states_df.empty:
+            self.all_states_df.sort_values(by='timestamp', inplace=True)
+            self.all_states_df.to_csv('all_states.csv', index=False) 
+
+
     def reinstall_library(self, library_cores, library_memory, function_slots):
-        self.remove_library()
+        self.manager.remove_library(self.library_name)
+        time.sleep(5)
         self.create_library('rl-library', self.function, library_cores, library_memory, function_slots)
-
-    def _cal_reward(self, cpu_util, mem_util):
-        if cpu_util < 0 or mem_util < 0:
-            print(f"error: cpu_util = {cpu_util}, mem_util = {mem_util}")
-            exit(1)
-        if cpu_util > 1.2 or mem_util > 1.2:
-            return -abs(cpu_util + mem_util - 2)
-        elif cpu_util + mem_util <= 2.4:
-            return cpu_util + mem_util
-        else:
-            return -abs(cpu_util + mem_util - 2)
 
     def get_action(self, action, action_range_start, action_range_end, available_actions):
         if action_range_start <= action < action_range_end:
@@ -168,7 +180,8 @@ class DDPG:
 
     def get_state(self):
         self.syn_states()
-        if not self.batch_start_timestamps:
+        # if there is no state data, return the initial state
+        if not self.start_timestamps:
             state = {
                 'avg_user_total_cpu_usage': 0,
                 'avg_user_memory_used_mb': 0,
@@ -179,11 +192,12 @@ class DDPG:
                 'library_cores': self.library_cores,
                 'library_memory': self.library_memory,
                 'function_slots': self.function_slots,
-                'remaining_function_calls': len(self.function_calls),
+                'remaining_function_calls': len(self.all_function_calls),
             }
             return state
-        last_start_timestamp = self.batch_start_timestamps[-1]
-        states_df = self.all_states_df[self.all_states_df['timestamp'] > last_start_timestamp]
+        # get the last batch of states
+        start_timestamp = self.start_timestamps[-1]
+        states_df = self.all_states_df[self.all_states_df['timestamp'] > start_timestamp]
         state = {
             'avg_user_total_cpu_usage': states_df['user_total_cpu_usage'].mean(),
             'avg_user_memory_used_mb': states_df['user_memory_used_mb'].mean(),
@@ -194,33 +208,38 @@ class DDPG:
             'library_cores': self.library_cores,
             'library_memory': self.library_memory,
             'function_slots': self.function_slots,
-            'remaining_function_calls': len(self.function_calls) - len(self.submitted_function_calls),
+            'remaining_function_calls': len(self.all_function_calls) - len(self.submitted_function_calls),
         }
-        
         return state
     
     def get_reward(self):
         state = self.get_state()
+        print(f"state = {state}")
         cpu_util = state["avg_user_total_cpu_usage"] / (self.library_cores * 100)
         mem_util = state["avg_user_memory_used_mb"] / self.library_memory
-        reward =  self._cal_reward(cpu_util, mem_util)
-        
+        if cpu_util < 0 or mem_util < 0:
+            print(f"error: cpu_util = {cpu_util}, mem_util = {mem_util}")
+            exit(1)
+        if cpu_util > 1.2 or mem_util > 1.2:
+            reward = -abs(cpu_util + mem_util - 2)
+        elif cpu_util + mem_util <= 2.4:
+            reward = cpu_util + mem_util
+        else:
+            reward = -abs(cpu_util + mem_util - 2)
         return reward
 
-    # Inputs: Batch of next states, rewards and terminal flags of size self.batchSize
-    # Target Q-value <- reward and bootstraped Q-value of next state via the target actor and target critic
-    # Output: Batch of Q-value targets
-    def get_QTarget(self, nextStateBatch, rewardBatch, terminalBatch):       
-        targetBatch = torch.FloatTensor(rewardBatch)
-        nonFinalMask = torch.ByteTensor(tuple(map(lambda s: s != True, terminalBatch)))
-        nextStateBatch = torch.cat(nextStateBatch)
-        nextActionBatch = self.targetActor(nextStateBatch)
-        qNext = self.targetCritic(nextStateBatch, nextActionBatch)  
+    def get_q_target(self, next_state_batch, reward_batch, terminal_batch):
+        target_batch = torch.FloatTensor(reward_batch)
+        non_final_mask = 1 - torch.ByteTensor(terminal_batch)
+        next_state_batch = torch.cat(next_state_batch)
+        next_action_batch = self.target_actor(next_state_batch)
+        q_next = self.target_critic(next_state_batch, next_action_batch)
         
-        nonFinalMask = self.discount * nonFinalMask.type(torch.FloatTensor)
-        targetBatch += nonFinalMask * qNext.squeeze().data
+        # if the next state is terminal, the target is the reward
+        non_final_mask = self.discount * non_final_mask.float()
+        target_batch += non_final_mask * q_next.squeeze().data
         
-        return Variable(targetBatch)
+        return target_batch
 
     # weighted average update of the target network and original network
     # Inputs: target actor(critic) and original actor(critic)
@@ -231,7 +250,7 @@ class DDPG:
     # Inputs: Current state of the episode
     # Output: the action which maximizes the Q-value of the current state-action pair
     def get_max_action(self, current_state):
-        noise = self.epsilon * Variable(torch.FloatTensor(self.noise()))
+        noise = self.epsilon * torch.FloatTensor(self.noise())
         action = self.actor(current_state) + noise
         
         # get the max
@@ -242,25 +261,25 @@ class DDPG:
         return max_index, action
 
     def register_function_calls(self, function_calls):
-        self.function_calls = function_calls
+        self.all_function_calls = function_calls
 
     def submit_function_calls(self, num):
         tasks_submitted = 0
-        for funcall in self.function_calls:
+        for funcall in self.all_function_calls:
             if funcall not in self.submitted_function_calls:
+                funcall.set_env_var('PATH', '/scratch365/jzhou24/env/bin/:$PATH')
                 self.manager.submit(funcall)
                 self.submitted_function_calls.add(funcall)
-                funcall.set_env_var('PATH', '/scratch365/jzhou24/env/bin/:$PATH')
                 tasks_submitted += 1
                 if tasks_submitted >= num:
                     break
         return tasks_submitted
 
     def get_batch_time_elapsed(self):
-        if not self.batch_start_timestamps or not self.batch_end_timestamps:
-            print("batch_start_timestamps or batch_end_timestamps is empty")
+        if not self.start_timestamps or not self.batch_end_timestamps:
+            print("start_timestamps or batch_end_timestamps is empty")
             exit(1)
-        time_start, time_end = self.batch_start_timestamps[-1], self.batch_end_timestamps[-1]
+        time_start, time_end = self.start_timestamps[-1], self.batch_end_timestamps[-1]
 
         if time_start > time_end:
             print(f"time_start = {time_start}, time_end = {time_end}")
@@ -269,8 +288,16 @@ class DDPG:
 
     def run_batch(self):
         from tqdm import tqdm
-        self.batch_start_timestamps.append(time.time())
-        tasks_submitted = self.submit_function_calls(self.functions_per_step)
+        self.start_timestamps.append(time.time())
+        tasks_submitted = 0
+        for funcall in self.all_function_calls:
+            if funcall not in self.submitted_function_calls:
+                funcall.set_env_var('PATH', '/scratch365/jzhou24/env/bin/:$PATH')
+                self.manager.submit(funcall)
+                self.submitted_function_calls.add(funcall)
+                tasks_submitted += 1
+                if tasks_submitted >= self.functions_per_step:
+                    break
         pbar = tqdm(total=tasks_submitted)
         while not self.manager.empty():
             t = self.manager.wait(0)
@@ -280,10 +307,12 @@ class DDPG:
         self.batch_end_timestamps.append(time.time())
         pbar.close()
 
-    def reset_state(self):
-        self.all_states_df = pd.DataFrame()
-        self.batch_start_timestamps = []
+    def epoch_reset(self):
+        # self.all_states_df = pd.DataFrame()
+        self.start_timestamps = []
         self.batch_end_timestamps = []
+        self.create_all_function_calls()
+        self.submitted_function_calls = set()
         # randomize the library cores, library memory, function slots
         self.library_cores = random.randint(1, 16)
         self.library_memory = random.randint(100, 1000)
@@ -298,8 +327,17 @@ class DDPG:
             'library_cores': self.library_cores,
             'library_memory': self.library_memory,
             'function_slots': self.function_slots,
-            'remaining_function_calls': len(self.function_calls),
+            'remaining_function_calls': len(self.all_function_calls),
         }
+
+    def create_all_function_calls(self):
+        self.all_function_calls = []
+        for _ in range(0, self.num_tasks):
+            # give a random size
+            rand_size = int(np.random.uniform(self.size_tasks, 100))
+            # make sure the size > 100 and < 30000
+            rand_size = max(100, min(2000, rand_size))
+            self.all_function_calls.append(vine.FunctionCall('rl-library', 'my_func', self.size_tasks))
 
     # training of the original and target actor-critic networks
     def train(self):
@@ -311,14 +349,14 @@ class DDPG:
         # for each episode
         for epoch in range(0, self.num_epochs):
             epoch_reward = 0
-            self.reset_state()
-            num_steps = len(self.function_calls) // self.functions_per_step
+            self.epoch_reset()
+            num_steps = len(self.all_function_calls) // self.functions_per_step
 
             for step in range(num_steps):
                 current_state = self.current_state
                 
                 # get maximizing action
-                current_state_tensor = Variable(obs_to_state(list(current_state.values())))
+                current_state_tensor = obs_to_state(list(current_state.values()))
                 self.actor.eval()
 
                 action_index, action = self.get_max_action(current_state_tensor)
@@ -334,56 +372,64 @@ class DDPG:
                 self.library_cores += library_cores_action
                 self.library_memory += library_memory_action
                 self.function_slots += function_slots_action
-                self.library_cores = max(1, min(self.library_cores, self.MAX_LIBRARY_CORES))
-                self.library_memory = max(100, min(self.library_memory, self.MAX_LIBRARY_MEMORY))
+                self.library_cores = min(self.library_cores, self.MAX_LIBRARY_CORES)
+                self.library_memory = min(self.library_memory, self.MAX_LIBRARY_MEMORY)
                 self.function_slots = max(2, min(self.function_slots, self.MAX_FUNCTION_SLOTS))
 
                 self.reinstall_library(self.library_cores, self.library_memory, self.function_slots)
                 self.run_batch()
 
                 next_state = self.get_state()
+
                 self.current_state = next_state
                 reward = self.get_reward()
                 epoch_reward += reward
 
                 print(f"epoch = {epoch}, step = {step}, action = ({self.library_cores}, {self.library_memory}, {self.function_slots}), reward = {reward}")
 
-                next_state_tensor = Variable(obs_to_state(list(next_state.values())))
-                self.replay_buffer.append((current_state_tensor, action, next_state_tensor, reward))
+                next_state_tensor = obs_to_state(list(next_state.values()))
+                # if no available tasks, the terminal_status is True
+                terminal_status = len(self.all_function_calls) == len(self.submitted_function_calls)
+                self.replay_buffer.append((current_state_tensor, action, next_state_tensor, reward, terminal_status))
 
                 # if the replay buffer is full, start training
                 if len(self.replay_buffer) >= self.replay_buffer_threshold:
                     print("start training...")
-                    current_state_batch, action_batch, next_state_batch, reward_batch = self.replay_buffer.sample_batch(self.batch_size)
-                    current_state_batch = torch.cat(current_state_batch)
-                    action_batch = torch.cat(action_batch)
+                    sample_batch = self.replay_buffer.sample_batch(self.batch_size)
+                    if sample_batch:
+                        current_state_batch, action_batch, next_state_batch, reward_batch, terminal_batch = sample_batch
+                        current_state_batch = torch.cat(current_state_batch)
+                        action_batch = torch.cat(action_batch)
+                        print(f"current_state_batch = {current_state_batch}, action_batch = {action_batch}, next_state_batch = {next_state_batch}, reward_batch = {reward_batch}, terminal_batch = {terminal_batch}")
+                        predicted_q_values = self.critic(current_state_batch, action_batch)
+                        target_q_values = self.get_q_target(next_state_batch, reward_batch, terminal_batch)
+                        
+                        print(f"predicted_q_values = {predicted_q_values}, target_q_values = {target_q_values}")
+                        # critic update
+                        self.critic_optimizer.zero_grad()
+                        critic_loss = self.mseloss(predicted_q_values.squeeze(), target_q_values)
+                        print(f"critic_loss = {critic_loss}")
+                        critic_loss.backward()
+                        self.critic_optimizer.step()
 
-                    predicted_QValues = self.critic(current_state_batch, action_batch)
-                    target_QValues = self.get_QTarget(next_state_batch, reward_batch, [False]*self.batch_size)
+                        # actor update
+                        self.actor_optimizer.zero_grad()
+                        actor_loss = -torch.mean(self.critic(current_state_batch, self.actor(current_state_batch)))
+                        print(f"actor_loss = {actor_loss}")
+                        actor_loss.backward()
+                        self.actor_optimizer.step()
 
-                    # critic update
-                    self.critic_optimizer.zero_grad()
-                    critic_loss = nn.MSELoss(predicted_QValues, target_QValues)
-                    print(f"critic_loss = {critic_loss}")
-                    critic_loss.backward()
-                    self.critic_optimizer.step()
-
-                    # actor update
-                    self.actor_optimizer.zero_grad()
-                    actor_loss = -torch.mean(self.critic(current_state_batch, self.actor(current_state_batch)))
-                    print(f"actor_loss = {actor_loss}")
-                    actor_loss.backward(retain_graph=True)
-                    self.actor_optimizer.step()
-
-                    # update target networks
-                    self.update_targets(self.target_actor, self.actor)
-                    self.update_targets(self.target_critic, self.critic)
-                    self.epsilon -= self.epsilon_decay
+                        # update target networks
+                        self.update_targets(self.target_actor, self.actor)
+                        self.update_targets(self.target_critic, self.critic)
+                        self.epsilon -= self.epsilon_decay
+                    else:
+                        print("Not enough samples to train.")
                 
             print(f"epoch_reward = {epoch_reward}")
             self.reward_graph.append(epoch_reward)
             
-            if epoch % 20 == 0:
+            if epoch % 10 == 0:
                 self.save_checkpoint(epoch)
 
     def save_checkpoint(self, epoch):
@@ -418,3 +464,9 @@ class DDPG:
         self.replay_buffer = checkpoint['replay_buffer']
         self.reward_graph = checkpoint['reward_graph']
         self.epsilon = checkpoint['epsilon']
+
+    def __del__(self):
+        # remove the csv files, should start with 'task'
+        for csv_file in glob.glob('*.csv'):
+            if csv_file.startswith('task'):
+                os.remove(csv_file)

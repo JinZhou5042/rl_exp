@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-def fanin_init(size, fanin=None):
+def fanin_init(size, fanin=None, scale_factor=1.0):
     """Initialize weights for actor and critic networks"""
     fanin = fanin or size[0]
-    w = 1./ np.sqrt(fanin)
+    w = scale_factor / np.sqrt(fanin)
     return torch.Tensor(size).uniform_(-w, w)
 
 HID_LAYER1 = 40
@@ -42,7 +42,6 @@ class Actor(nn.Module):
         h1_norm = self.bn1(h1)
         h2 = self.ReLU(self.fc2(h1_norm))
         h2_norm = self.bn2(h2)
-        # action = self.Tanh((self.fc3(h2_norm)))
         action = self.Softmax(self.fc3(h2_norm))
         return action
         

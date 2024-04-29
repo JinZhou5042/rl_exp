@@ -1,4 +1,5 @@
 import random
+import warnings
 from collections import deque
 MINIBATCH_SIZE = 64
 
@@ -16,12 +17,12 @@ class Buffer:
             return None
         else:
             batch = random.sample(self.data, batchSize)
-            curState = [element[0] for element in batch]
+            current_state = [element[0] for element in batch]
             action = [element[1] for element in batch]
-            nextState = [element[2] for element in batch]
+            next_state = [element[2] for element in batch]
             reward = [element[3] for element in batch]
             terminal = [element[4] for element in batch]
-        return curState, action, nextState, reward, terminal
+        return current_state, action, next_state, reward, terminal
                   
     def append(self, element):
         self.data.append(element)  

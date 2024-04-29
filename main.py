@@ -8,6 +8,8 @@ import subprocess
 import time
 import glob
 import argparse
+import numpy as np
+import random
 from ddpg import DDPG
 import shutil
 
@@ -16,14 +18,14 @@ import threading
 def main():
     parser = argparse.ArgumentParser(description="")
     parser.add_argument('--port', type=int, default=9124)
-    parser.add_argument('--tasks', type=int, default=1000)
-    parser.add_argument('--size', type=int, default=100)
+    parser.add_argument('--tasks', type=int, default=20)
+    parser.add_argument('--size', type=int, default=8000)
     parser.add_argument('--library-cores', default=16, type=int)
     parser.add_argument('--library-memory', default=1000, type=int)
     parser.add_argument('--function-slots', default=8, type=int)
     args = parser.parse_args()
 
-    size = args.size
+    size_tasks = args.size
     num_tasks = args.tasks
     library_cores = args.library_cores
     library_memory = args.library_memory
@@ -32,19 +34,9 @@ def main():
     # create agent
     q = vine.Manager(port=args.port)
     q.set_name("rl-manager")
-    agent = DDPG(q)
-    agent.create_library('rl-library', my_func, library_cores, library_memory, function_slots)
+    agent = DDPG(q, "rl-library", my_func, library_cores, library_memory, function_slots, size_tasks, num_tasks)
 
     # create tasks
-    print("creating function calls ...")
-    function_calls = []
-    for _ in range(0, num_tasks):
-        function_calls.append(vine.FunctionCall('rl-library', 'my_func', size))
-    agent.register_function_calls(function_calls)
-
-    # submit tasks
-    # get reward
-    # print("reward = ", agent.get_batch_reward())
 
     agent.train()
 
